@@ -14,6 +14,53 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+def extract_text_fallback(doc) -> str:
+    """
+    Fallback text extraction using basic pymupdf when pymupdf4llm fails.
+
+    Args:
+        doc: PyMuPDF document object
+
+    Returns:
+        Extracted text as markdown-formatted string
+    """
+    md_parts = []
+
+    for page_num, page in enumerate(doc, 1):
+        md_parts.append(f"\n\n---\n\n## Page {page_num}\n\n")
+
+        blocks = page.get_text("dict", sort=True)["blocks"]
+
+        for block in blocks:
+            if block["type"] == 0:  # Text block
+                for line in block.get("lines", []):
+                    line_text = ""
+                    for span in line.get("spans", []):
+                        text = span.get("text", "")
+                        font_size = span.get("size", 12)
+                        flags = span.get("flags", 0)
+
+                        # Check for bold (bit 4) or italic (bit 1)
+                        is_bold = flags & 16
+                        is_italic = flags & 2
+
+                        if is_bold and is_italic:
+                            text = f"***{text}***"
+                        elif is_bold:
+                            text = f"**{text}**"
+                        elif is_italic:
+                            text = f"*{text}*"
+
+                        line_text += text
+
+                    if line_text.strip():
+                        md_parts.append(line_text.strip() + "\n")
+
+                md_parts.append("\n")
+
+    return "".join(md_parts)
+
+
 def convert_pdf_to_markdown(pdf_bytes: bytes, filename: str) -> dict:
     """
     Convert a single PDF file to Markdown format.
@@ -25,10 +72,16 @@ def convert_pdf_to_markdown(pdf_bytes: bytes, filename: str) -> dict:
     Returns:
         Dictionary with filename, markdown content, and status
     """
+    doc = None
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        md_text = pymupdf4llm.to_markdown(doc)
-        doc.close()
+
+        # Try pymupdf4llm first
+        try:
+            md_text = pymupdf4llm.to_markdown(doc)
+        except (AttributeError, TypeError) as e:
+            # Fallback for 'NoneType' object has no attribute 'tables' and similar errors
+            md_text = extract_text_fallback(doc)
 
         return {
             "filename": filename,
@@ -37,12 +90,27 @@ def convert_pdf_to_markdown(pdf_bytes: bytes, filename: str) -> dict:
             "error": None
         }
     except Exception as e:
-        return {
-            "filename": filename,
-            "markdown": None,
-            "success": False,
-            "error": str(e)
-        }
+        # Final fallback: try basic text extraction
+        try:
+            if doc is None:
+                doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+            md_text = extract_text_fallback(doc)
+            return {
+                "filename": filename,
+                "markdown": md_text,
+                "success": True,
+                "error": None
+            }
+        except Exception as fallback_error:
+            return {
+                "filename": filename,
+                "markdown": None,
+                "success": False,
+                "error": f"{str(e)} (fallback also failed: {str(fallback_error)})"
+            }
+    finally:
+        if doc:
+            doc.close()
 
 
 def create_zip_archive(converted_files: list) -> bytes:
